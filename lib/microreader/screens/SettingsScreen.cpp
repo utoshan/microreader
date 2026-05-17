@@ -190,13 +190,13 @@ void SettingsScreen::on_start() {
 
   // --- Controls ---
   idx_invert_side_ = count();
-  add_item(app_->invert_side_buttons() ? "Side Btn: Next/Prev" : "Side Btn: Prev/Next");
+  add_item(get_side_paging_label(app_->invert_side_buttons()));
 
   idx_invert_bottom_paging_ = count();
-  add_item(app_->invert_bottom_paging() ? "Reader Btn: Prev/Next" : "Reader Btn: Next/Prev");
+  add_item(get_bottom_paging_label(app_->invert_bottom_paging()));
 
   idx_invert_menu_ = count();
-  add_item(app_->invert_menu_buttons() ? "Menu Btn: Up/Down" : "Menu Btn: Down/Up");
+  add_item(get_menu_nav_label(app_->invert_menu_buttons()));
 
   add_separator();
 
