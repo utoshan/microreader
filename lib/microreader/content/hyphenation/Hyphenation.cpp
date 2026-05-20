@@ -283,15 +283,6 @@ size_t find_hyphen_break(const IFont& font, const char* word_ptr, size_t len, Fo
   }
   buf[hyph_len] = '\0';
 
-  // Count UTF-8 code points in a byte range (continuation bytes 0x80–0xBF don't start a codepoint).
-  auto utf8_codepoint_count = [](const char* s, size_t byte_len) -> int {
-    int n = 0;
-    for (size_t i = 0; i < byte_len; ++i)
-      if (((unsigned char)s[i] & 0xC0) != 0x80)
-        ++n;
-    return n;
-  };
-
   static constexpr int kMinCharsEachSide = 2;
 
   size_t positions[32];
@@ -299,21 +290,43 @@ size_t find_hyphen_break(const IFont& font, const char* word_ptr, size_t len, Fo
   if (n <= 0)
     return 0;
   const uint16_t hyphen_w = font.char_width('-', style, size_pct);
+
+  // Pre-compute cumulative codepoint counts for the word (O(copy_len) once).
+  // cum_cp[i] = number of UTF-8 codepoints in word_ptr[0..i).
+  uint8_t cum_cp[129];
+  cum_cp[0] = 0;
+  for (size_t i = 0; i < copy_len && i < 128; ++i)
+    cum_cp[i + 1] = cum_cp[i] + (((unsigned char)word_ptr[i] & 0xC0) != 0x80 ? 1 : 0);
+  const uint8_t total_hyph_cp = (hyph_len <= copy_len) ? cum_cp[hyph_len] : cum_cp[copy_len];
+
+  // Pre-compute incremental prefix pixel widths (O(copy_len) total instead of O(N * avg_pos)).
+  // width(0..positions[i]) ≈ sum of segment widths. Kerning across segment boundaries is not
+  // counted, but the error is at most ±2px which is acceptable for hyphenation decisions.
+  uint16_t prefix_ws[32];
+  {
+    size_t prev = 0;
+    for (int i = 0; i < n; ++i) {
+      size_t pos = positions[i];
+      if (pos > copy_len)
+        pos = copy_len;
+      uint16_t seg =
+          (pos > prev) ? font.word_width(word_ptr + prev, static_cast<uint16_t>(pos - prev), style, size_pct) : 0;
+      prefix_ws[i] = (i == 0 ? 0 : prefix_ws[i - 1]) + seg;
+      prev = pos;
+    }
+  }
+
   for (int i = n - 1; i >= 0; --i) {
     size_t pos = positions[i];
     if (pos == 0 || pos >= len)
       continue;
     // Enforce leftmin/rightmin in Unicode code points, not bytes.
-    // Without this, a 2-byte character like ß counts as 2 bytes remaining
-    // and passes rightmin=2 even though only 1 character follows.
-    // Use hyph_len (stripped word) for the suffix check so trailing punctuation
-    // that was stripped (e.g. the comma in "weiß,") doesn't inflate the count.
-    if (utf8_codepoint_count(word_ptr, pos) < kMinCharsEachSide)
+    const size_t safe_pos = (pos <= copy_len) ? pos : copy_len;
+    if (cum_cp[safe_pos] < kMinCharsEachSide)
       continue;
-    size_t suffix_byte_len = pos < hyph_len ? hyph_len - pos : 0;
-    if (utf8_codepoint_count(word_ptr + pos, suffix_byte_len) < kMinCharsEachSide)
+    if (total_hyph_cp - cum_cp[safe_pos] < kMinCharsEachSide)
       continue;
-    uint16_t prefix_w = font.word_width(word_ptr, static_cast<uint16_t>(pos), style, size_pct);
+    uint16_t prefix_w = prefix_ws[i];
     bool ends_with_hyphen = (word_ptr[pos - 1] == '-');
     uint16_t extra = ends_with_hyphen ? 0 : hyphen_w;
     if (prefix_w + extra <= avail) {

@@ -36,6 +36,32 @@ struct LayoutLine {
   uint32_t text_offset = 0;  // byte offset of the first character from the start of the paragraph's text
 };
 
+// Non-owning view of a laid-out line. Words point into PageContent::word_pool.
+// Valid for the lifetime of the owning PageContent object.
+struct PageLine {
+  struct Words {
+    const LayoutWord* data_ = nullptr;
+    uint16_t size_ = 0;
+    const LayoutWord* begin() const {
+      return data_;
+    }
+    const LayoutWord* end() const {
+      return data_ + size_;
+    }
+    uint16_t size() const {
+      return size_;
+    }
+    bool empty() const {
+      return size_ == 0;
+    }
+    const LayoutWord& operator[](size_t i) const {
+      return data_[i];
+    }
+  } words;
+  bool hyphenated = false;
+  uint32_t text_offset = 0;
+};
+
 // ---------------------------------------------------------------------------
 // layout_paragraph() — break a single paragraph into lines
 // ---------------------------------------------------------------------------
@@ -102,7 +128,7 @@ struct PageHrItem {
 struct PageTextItem {
   uint16_t paragraph_index;
   uint16_t line_index;
-  LayoutLine line;
+  PageLine line;          // non-owning; words point into PageContent::word_pool
   uint16_t y_offset;      // pixel offset from page top (absolute, includes vertical centering)
   uint16_t height = 0;    // line height in pixels
   uint16_t baseline = 0;  // baseline distance from top of line to baseline
@@ -115,6 +141,7 @@ struct PageTextItem {
 using PageContentItem = std::variant<PageTextItem, PageImageItem, PageHrItem>;
 
 struct PageContent {
+  std::vector<LayoutWord> word_pool;   // flat storage for all PageTextItem words (stable after construction)
   std::vector<PageContentItem> items;  // ordered top-to-bottom; y_offsets are absolute screen coords
   PagePosition start;
   PagePosition end;  // one-past-end position
@@ -262,7 +289,7 @@ class TextLayout {
   struct PageItem {
     enum Kind { TextLine, Image, Hr, Empty, PageBreak, Spacer } kind;
     uint16_t para_idx, line_idx;
-    LayoutLine layout_line;
+    const LayoutLine* line_ptr = nullptr;  // TextLine only: points into LaidOutParagraph cache
     uint16_t height, baseline = 0;
     uint16_t img_key = 0, img_w = 0, img_h = 0, img_x = 0, img_y_crop = 0;
   };
@@ -351,4 +378,6 @@ class TextLayout {
 // Per-page layout sub-timings (microseconds). Reset by TextLayout::layout(); read after it returns.
 extern int64_t g_layout_hyph_us;     // time spent in find_hyphen_break()
 extern int64_t g_layout_metrics_us;  // time spent in font.word_width()
+extern int64_t g_layout_para_us;     // total time in layout_para_lines() calls (incl. hyph+metrics)
+extern int g_layout_cache_misses;    // paragraphs that triggered a fresh layout_para_lines()
 #endif

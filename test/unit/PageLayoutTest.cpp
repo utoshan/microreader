@@ -9,7 +9,7 @@
 using namespace microreader;
 
 // ===== Helper: extract text from a layout line =====
-static std::string line_text(const LayoutLine& line) {
+static std::string line_text(const PageLine& line) {
   std::string result;
   for (size_t i = 0; i < line.words.size(); ++i) {
     if (i > 0)

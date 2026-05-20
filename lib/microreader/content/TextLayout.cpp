@@ -10,6 +10,8 @@
 #include "esp_timer.h"
 int64_t g_layout_hyph_us = 0;
 int64_t g_layout_metrics_us = 0;
+int64_t g_layout_para_us = 0;   // total time inside layout_para_lines() calls
+int g_layout_cache_misses = 0;  // paragraphs that required fresh layout_para_lines()
 #endif
 
 // Set to 1 to print a step-by-step trace of forward + backward page collection.
@@ -258,7 +260,9 @@ static std::vector<LayoutLine> layout_para_lines(const IFont& font, const Layout
   const int16_t indent = para.indent.value_or(0);
 
   std::vector<LayoutLine> lines;
+  lines.reserve(12);
   LayoutLine current;
+  current.words.reserve(16);
   uint16_t x = opts.first_line_extra_indent + ((indent > 0) ? static_cast<uint16_t>(indent) : 0);
   uint16_t cur_line_width = max_width;
   bool first_line = true, prev_run_ended_space = true;
@@ -385,7 +389,10 @@ static std::vector<LayoutLine> layout_para_lines(const IFont& font, const Layout
             current.hyphenated = true;
             flush_line(line_width, current.words, false);
             lines.push_back(std::move(current));
-            current = LayoutLine{};
+            current.words.clear();
+            current.words.reserve(16);
+            current.hyphenated = false;
+            current.text_offset = 0;
             x = run.margin_left;
             first_line = false;
             word_ptr += split;
@@ -405,7 +412,10 @@ static std::vector<LayoutLine> layout_para_lines(const IFont& font, const Layout
         // No hyphenation possible — flush line and retry on the next line.
         flush_line(line_width, current.words, false);
         lines.push_back(std::move(current));
-        current = LayoutLine{};
+        current.words.clear();
+        current.words.reserve(16);
+        current.hyphenated = false;
+        current.text_offset = 0;
         x = run.margin_left;
         first_line = false;
         needs_space = false;
@@ -425,7 +435,10 @@ static std::vector<LayoutLine> layout_para_lines(const IFont& font, const Layout
     if (run.breaking) {
       flush_line(cur_line_width, current.words, true);
       lines.push_back(std::move(current));
-      current = LayoutLine{};
+      current.words.clear();
+      current.words.reserve(16);
+      current.hyphenated = false;
+      current.text_offset = 0;
       x = 0;
       first_line = false;
       prev_run_ended_space = true;
@@ -562,7 +575,16 @@ const TextLayout::LaidOutParagraph& TextLayout::get_laid_out_(size_t pi) const {
       lo.override_publisher_fonts = opts.override_publisher_fonts;
       if (img.has_image && img.width > 0 && img.height > 0 && !img.promoted)
         lo.first_line_extra_indent = img.width + 4;
+#ifdef ESP_PLATFORM
+      {
+        int64_t _tp = esp_timer_get_time();
+        slot.lines = layout_para_lines(font, lo, para.text, hyphenation_lang_);
+        g_layout_para_us += esp_timer_get_time() - _tp;
+      }
+      ++g_layout_cache_misses;
+#else
       slot.lines = layout_para_lines(font, lo, para.text, hyphenation_lang_);
+#endif
       slot.line_heights.resize(slot.lines.size());
       slot.line_baselines.resize(slot.lines.size());
       for (size_t i = 0; i < slot.lines.size(); ++i) {
@@ -662,9 +684,16 @@ static void bake_y(PageContent& page, uint16_t v_off) {
 template <typename GetLP>
 static uint16_t build_page_items(PageContent& page, std::vector<TextLayout::PageItem>& raw, const PageOptions& opts,
                                  const IFont& font, IParagraphSource& source, bool is_chapter_start, GetLP get_lp) {
+  page.items.reserve(raw.size());
+
   const uint16_t dy = font.y_advance();
   const uint16_t cw = opts.width - opts.padding_left - opts.padding_right;
   uint16_t y = 0, prev_para = UINT16_MAX;
+
+  // Cache the most-recently used LaidOutParagraph to avoid repeated get_lp calls
+  // for consecutive lines of the same paragraph.
+  uint16_t cur_lp_para = UINT16_MAX;
+  const TextLayout::LaidOutParagraph* cur_lp_ptr = nullptr;
 
   for (auto& item : raw) {
     if (prev_para != UINT16_MAX && item.para_idx != prev_para) {
@@ -674,16 +703,32 @@ static uint16_t build_page_items(PageContent& page, std::vector<TextLayout::Page
 
     switch (item.kind) {
       case TextLayout::PageItem::TextLine: {
-        PageTextItem ti{item.para_idx, item.line_idx, std::move(item.layout_line), y, item.height,
-                        item.baseline, std::nullopt};
+        // Re-validate via get_lp (cache lookup), deduplicated per paragraph.
+        if (item.para_idx != cur_lp_para) {
+          cur_lp_ptr = &get_lp(item.para_idx);
+          cur_lp_para = item.para_idx;
+        }
+        const LayoutLine& src = cur_lp_ptr->lines[item.line_idx];
+        uint16_t base = static_cast<uint16_t>(page.word_pool.size());
+        page.word_pool.insert(page.word_pool.end(), src.words.begin(), src.words.end());
+        PageLine pl;
+        // data_ is tentative — fixed up after the loop in case pool reallocated
+        pl.words.data_ = page.word_pool.data() + base;
+        pl.words.size_ = static_cast<uint16_t>(src.words.size());
+        pl.hyphenated = src.hyphenated;
+        pl.text_offset = src.text_offset;
+        PageTextItem ti{item.para_idx, item.line_idx, pl, y, item.height, item.baseline, std::nullopt};
         if (item.line_idx == 0) {
-          const auto& lp = get_lp(item.para_idx);
-          if (!lp.inline_img.promoted && lp.inline_img.has_image && lp.inline_img.width > 0 &&
-              lp.inline_img.height > 0) {
+          if (!cur_lp_ptr->inline_img.promoted && cur_lp_ptr->inline_img.has_image &&
+              cur_lp_ptr->inline_img.width > 0 && cur_lp_ptr->inline_img.height > 0) {
             uint16_t bl_y = y + item.baseline;
-            uint16_t img_y = bl_y >= lp.inline_img.height ? bl_y - lp.inline_img.height : 0;
-            ti.inline_image = PageImageItem{item.para_idx,        lp.inline_img.key, lp.inline_img.width,
-                                            lp.inline_img.height, opts.padding_left, img_y};
+            uint16_t img_y = bl_y >= cur_lp_ptr->inline_img.height ? bl_y - cur_lp_ptr->inline_img.height : 0;
+            ti.inline_image = PageImageItem{item.para_idx,
+                                            cur_lp_ptr->inline_img.key,
+                                            cur_lp_ptr->inline_img.width,
+                                            cur_lp_ptr->inline_img.height,
+                                            opts.padding_left,
+                                            img_y};
           }
         }
         page.items.push_back(std::move(ti));
@@ -705,6 +750,20 @@ static uint16_t build_page_items(PageContent& page, std::vector<TextLayout::Page
     if (item.kind != TextLayout::PageItem::Spacer)
       prev_para = item.para_idx;
   }
+
+  // Fix up PageLine::words.data_ pointers in case word_pool reallocated during insertions.
+  // We track the base offset of each line's words sequentially through the pool.
+  {
+    const LayoutWord* base = page.word_pool.data();
+    uint32_t off = 0;
+    for (auto& ci : page.items) {
+      if (auto* ti = std::get_if<PageTextItem>(&ci)) {
+        ti->line.words.data_ = base + off;
+        off += ti->line.words.size_;
+      }
+    }
+  }
+
   return y;
 }
 
@@ -964,7 +1023,7 @@ static std::optional<Collected> collect_text(const LaidOut& lp, size_t idx, uint
   if (bl > available)
     return std::nullopt;
 
-  PageItem item{PageItem::TextLine, lp.para_idx, static_cast<uint16_t>(line_idx), lp.lines[line_idx], lh, bl};
+  PageItem item{PageItem::TextLine, lp.para_idx, static_cast<uint16_t>(line_idx), nullptr, lh, bl};
   return Collected{std::move(item), forward ? start_idx + 1 : start_idx};
 }
 
@@ -1222,6 +1281,8 @@ PageContent TextLayout::layout() const {
 #ifdef ESP_PLATFORM
   g_layout_hyph_us = 0;
   g_layout_metrics_us = 0;
+  g_layout_para_us = 0;
+  g_layout_cache_misses = 0;
 #endif
   MR_TRACE("=== layout() FORWARD from {p=%u,off=%u,to=%u} ===", (unsigned)position_.paragraph,
            (unsigned)position_.offset, (unsigned)position_.text_offset);

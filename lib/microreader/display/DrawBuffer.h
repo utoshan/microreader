@@ -380,7 +380,7 @@ class DrawBuffer {
   // Render all words of a LayoutLine and — on the BW plane only — draw continuous
   // underline decorations spanning each run of consecutive linked words. This is the
   // correct level of abstraction: underlines are line decorations, not per-word.
-  void draw_layout_line(uint8_t* buf, int x_offset, int baseline_y, const LayoutLine& line, const BitmapFontSet& fonts,
+  void draw_layout_line(uint8_t* buf, int x_offset, int baseline_y, const PageLine& line, const BitmapFontSet& fonts,
                         GrayPlane plane, bool white);
 
   // -- Grayscale display operations
@@ -655,40 +655,88 @@ class DrawBuffer {
     const int row_stride = (bitmap_width + 7) / 8;
 
     if (rotation == Rotation::Deg90) {
-      // Optimized path for portrait (Deg90) — the common case.
+      // Optimized transposed path for portrait (Deg90) — the common case.
       //
-      // Physical mapping: px = ly = gy+row (constant per row)
-      //                   py = kPhysicalHeight-1 - lx = kPhysicalHeight-1 - gx - col
+      // Physical mapping: px = gy + row,  py = kPhysicalHeight-1 - gx - col
       //
-      // Per row: hoisted constants eliminate all per-pixel multiplies and
-      // 4 bounds comparisons, reducing inner loop to ~3 ops/pixel.
+      // Transposed loop: outer=col (selects one physical row → sequential memory),
+      // inner=row (writes adjacent bits within that row).
+      // Batched inner loop packs 8 rows into one output byte for 8× fewer
+      // read-modify-write ops over the cache-friendly forward scan.
       const int lpy_base = DisplayFrame::kPhysicalHeight - 1 - gx - t.phys_y0;
-      // col range where py is in-bounds: lpy_base - col must be in [0, t.phys_h)
-      const int col_lo_clip = lpy_base - (t.phys_h - 1);  // col >= this
-      const int col_hi_clip = lpy_base;                   // col <= this
-      for (int row = 0; row < bitmap_height; ++row) {
-        const int ly = gy + row;
-        // px = ly: check x-bounds once per row, skip entire row if out.
-        if (ly < t.phys_x0 || ly >= t.phys_x0 + t.phys_w)
-          continue;
-        const int lpx = ly - t.phys_x0;
-        const uint8_t bit_mask = static_cast<uint8_t>(0x80u >> (lpx & 7));
-        const int byte_col = lpx >> 3;
-        // Clamp column range to both bitmap width and y-bounds.
-        const int col_start = col_lo_clip > 0 ? col_lo_clip : 0;
-        const int col_end = col_hi_clip < bitmap_width - 1 ? col_hi_clip + 1 : bitmap_width;
-        if (col_start >= col_end)
-          continue;
-        const uint8_t* row_data = bits + row * row_stride;
-        // Starting bidx: lpy = lpy_base - col_start
-        size_t bidx = static_cast<size_t>((lpy_base - col_start) * t.stride + byte_col);
-        for (int col = col_start; col < col_end; ++col, bidx -= t.stride) {
-          const bool bit_set = (row_data[col >> 3] >> (7 - (col & 7))) & 1;
-          if (invert_select ? bit_set : !bit_set) {
+      // col range where py_local = lpy_base - col is in [0, phys_h):
+      const int col_start = (lpy_base >= t.phys_h) ? lpy_base - (t.phys_h - 1) : 0;
+      const int col_end = (lpy_base >= 0) ? (lpy_base < bitmap_width ? lpy_base + 1 : bitmap_width) : 0;
+      if (col_start >= col_end)
+        return;
+      // row range where px_local = lpx0 + row is in [0, phys_w):
+      const int lpx0 = gy - t.phys_x0;
+      const int row_lo = (lpx0 < 0) ? -lpx0 : 0;
+      const int row_hi = (lpx0 + bitmap_height > t.phys_w) ? t.phys_w - lpx0 : bitmap_height;
+      if (row_lo >= row_hi)
+        return;
+
+      for (int col = col_start; col < col_end; ++col) {
+        uint8_t* const row_ptr = t.buf + static_cast<size_t>(lpy_base - col) * static_cast<size_t>(t.stride);
+        const int src_byte_off = col >> 3;
+        const int src_shift = 7 - (col & 7);
+
+        int row = row_lo;
+
+        // Scalar prefix: advance until (lpx0 + row) is on a byte boundary.
+        const int align_end_raw = row_lo + ((8 - ((lpx0 + row_lo) & 7)) & 7);
+        const int prefix_end = align_end_raw < row_hi ? align_end_raw : row_hi;
+        for (; row < prefix_end; ++row) {
+          const uint8_t glyph_bit = static_cast<uint8_t>((bits[row * row_stride + src_byte_off] >> src_shift) & 1u);
+          if (invert_select ? glyph_bit : !glyph_bit) {
+            const int px_local = lpx0 + row;
+            const uint8_t mask = static_cast<uint8_t>(0x80u >> (px_local & 7));
             if (white)
-              t.buf[bidx] |= bit_mask;
+              row_ptr[px_local >> 3] |= mask;
             else
-              t.buf[bidx] &= static_cast<uint8_t>(~bit_mask);
+              row_ptr[px_local >> 3] &= static_cast<uint8_t>(~mask);
+          }
+        }
+
+        // Batched inner loop: 8 source rows → 1 output byte (byte-aligned in framebuffer).
+        for (; row + 8 <= row_hi; row += 8) {
+          const int out_idx = (lpx0 + row) >> 3;  // byte-aligned: (lpx0+row) & 7 == 0
+          const uint8_t* src = bits + row * row_stride + src_byte_off;
+          // Pack column bits from 8 successive rows into one byte (MSB = row+0).
+          uint8_t col_byte;
+          col_byte = static_cast<uint8_t>((*src >> src_shift) & 1u) << 7;
+          src += row_stride;
+          col_byte |= static_cast<uint8_t>((*src >> src_shift) & 1u) << 6;
+          src += row_stride;
+          col_byte |= static_cast<uint8_t>((*src >> src_shift) & 1u) << 5;
+          src += row_stride;
+          col_byte |= static_cast<uint8_t>((*src >> src_shift) & 1u) << 4;
+          src += row_stride;
+          col_byte |= static_cast<uint8_t>((*src >> src_shift) & 1u) << 3;
+          src += row_stride;
+          col_byte |= static_cast<uint8_t>((*src >> src_shift) & 1u) << 2;
+          src += row_stride;
+          col_byte |= static_cast<uint8_t>((*src >> src_shift) & 1u) << 1;
+          src += row_stride;
+          col_byte |= static_cast<uint8_t>((*src >> src_shift) & 1u);
+          // col_byte bit (7-b) = glyph source bit for row+b. 1=background, 0=ink (normal).
+          const uint8_t ink = invert_select ? col_byte : static_cast<uint8_t>(~col_byte);
+          if (white)
+            row_ptr[out_idx] |= ink;
+          else
+            row_ptr[out_idx] &= static_cast<uint8_t>(~ink);
+        }
+
+        // Scalar tail.
+        for (; row < row_hi; ++row) {
+          const uint8_t glyph_bit = static_cast<uint8_t>((bits[row * row_stride + src_byte_off] >> src_shift) & 1u);
+          if (invert_select ? glyph_bit : !glyph_bit) {
+            const int px_local = lpx0 + row;
+            const uint8_t mask = static_cast<uint8_t>(0x80u >> (px_local & 7));
+            if (white)
+              row_ptr[px_local >> 3] |= mask;
+            else
+              row_ptr[px_local >> 3] &= static_cast<uint8_t>(~mask);
           }
         }
       }
@@ -949,7 +997,7 @@ inline int DrawBuffer::draw_text_plane(uint8_t* buf, int x, int baseline_y, cons
   return draw_text_impl_(t, x, baseline_y, text, len, *f, plane, white, style, rotation_);
 }
 
-inline void DrawBuffer::draw_layout_line(uint8_t* buf, int x_offset, int baseline_y, const LayoutLine& line,
+inline void DrawBuffer::draw_layout_line(uint8_t* buf, int x_offset, int baseline_y, const PageLine& line,
                                          const BitmapFontSet& fonts, GrayPlane plane, bool white) {
   const RenderTarget t{buf, DisplayFrame::kStride, 0, 0, DisplayFrame::kPhysicalWidth, DisplayFrame::kPhysicalHeight};
 
