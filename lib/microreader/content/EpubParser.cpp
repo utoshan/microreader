@@ -154,6 +154,72 @@ static uint32_t fnv1a(const char* data, size_t len) {
 // sub-parsers. This avoids XmlReader buffer state issues where nested parse
 // functions break on large OPFs (e.g. 77K+ bytes with 500+ manifest items).
 
+// Decode basic HTML entities (used by NCX and OPF parsers)
+static std::string decode_entities(const std::string& text) {
+  std::string result;
+  result.reserve(text.size());
+  size_t i = 0;
+  while (i < text.size()) {
+    if (text[i] == '&') {
+      size_t semi = text.find(';', i);
+      if (semi != std::string::npos && semi - i < 12) {
+        std::string entity = text.substr(i + 1, semi - i - 1);
+        if (entity == "amp")
+          result += '&';
+        else if (entity == "lt")
+          result += '<';
+        else if (entity == "gt")
+          result += '>';
+        else if (entity == "quot")
+          result += '"';
+        else if (entity == "apos")
+          result += '\'';
+        else if (entity == "nbsp")
+          result += ' ';
+        else if (!entity.empty() && entity[0] == '#') {
+          // Numeric entity
+          uint32_t code = 0;
+          if (entity.size() > 1 && entity[1] == 'x') {
+            for (size_t j = 2; j < entity.size(); ++j)
+              code = code * 16 + (std::isdigit(static_cast<unsigned char>(entity[j]))
+                                      ? entity[j] - '0'
+                                      : std::tolower(static_cast<unsigned char>(entity[j])) - 'a' + 10);
+          } else {
+            for (size_t j = 1; j < entity.size(); ++j)
+              code = code * 10 + (entity[j] - '0');
+          }
+          // UTF-8 encode
+          if (code < 0x80) {
+            result += static_cast<char>(code);
+          } else if (code < 0x800) {
+            result += static_cast<char>(0xC0 | (code >> 6));
+            result += static_cast<char>(0x80 | (code & 0x3F));
+          } else if (code < 0x10000) {
+            result += static_cast<char>(0xE0 | (code >> 12));
+            result += static_cast<char>(0x80 | ((code >> 6) & 0x3F));
+            result += static_cast<char>(0x80 | (code & 0x3F));
+          } else {
+            result += static_cast<char>(0xF0 | (code >> 18));
+            result += static_cast<char>(0x80 | ((code >> 12) & 0x3F));
+            result += static_cast<char>(0x80 | ((code >> 6) & 0x3F));
+            result += static_cast<char>(0x80 | (code & 0x3F));
+          }
+          i = semi + 1;
+          continue;
+        } else {
+          // Unknown entity — keep as-is
+          result += text.substr(i, semi - i + 1);
+        }
+        i = semi + 1;
+        continue;
+      }
+    }
+    result += text[i];
+    ++i;
+  }
+  return result;
+}
+
 // Parse NCX table of contents
 static EpubError parse_ncx(IZipFile& file, const ZipReader& zip, const ZipEntry& entry, const std::string& root_dir,
                            TableOfContents& toc, uint8_t* work_buf, size_t work_buf_size, uint8_t* xml_buf,
@@ -186,7 +252,7 @@ static EpubError parse_ncx(IZipFile& file, const ZipReader& zip, const ZipEntry&
       } else if (in_nav_label && sv_eq(ev.name, "text")) {
         XmlEvent text;
         if (reader.next_event(text) == XmlError::Ok && text.type == XmlEventType::Text) {
-          current_label = sv_to_string(text.content);
+          current_label = decode_entities(sv_to_string(text.content));
         }
       } else if (nav_depth > 0 && sv_eq(ev.name, "content")) {
         auto src = sv_to_string(ev.attrs.get("src"));
@@ -465,72 +531,6 @@ EpubError Epub::open_zip_only(IZipFile& file) {
 // ---------------------------------------------------------------------------
 
 namespace {
-
-// Decode basic HTML entities
-static std::string decode_entities(const std::string& text) {
-  std::string result;
-  result.reserve(text.size());
-  size_t i = 0;
-  while (i < text.size()) {
-    if (text[i] == '&') {
-      size_t semi = text.find(';', i);
-      if (semi != std::string::npos && semi - i < 12) {
-        std::string entity = text.substr(i + 1, semi - i - 1);
-        if (entity == "amp")
-          result += '&';
-        else if (entity == "lt")
-          result += '<';
-        else if (entity == "gt")
-          result += '>';
-        else if (entity == "quot")
-          result += '"';
-        else if (entity == "apos")
-          result += '\'';
-        else if (entity == "nbsp")
-          result += ' ';
-        else if (!entity.empty() && entity[0] == '#') {
-          // Numeric entity
-          uint32_t code = 0;
-          if (entity.size() > 1 && entity[1] == 'x') {
-            for (size_t j = 2; j < entity.size(); ++j)
-              code = code * 16 + (std::isdigit(static_cast<unsigned char>(entity[j]))
-                                      ? entity[j] - '0'
-                                      : std::tolower(static_cast<unsigned char>(entity[j])) - 'a' + 10);
-          } else {
-            for (size_t j = 1; j < entity.size(); ++j)
-              code = code * 10 + (entity[j] - '0');
-          }
-          // UTF-8 encode
-          if (code < 0x80) {
-            result += static_cast<char>(code);
-          } else if (code < 0x800) {
-            result += static_cast<char>(0xC0 | (code >> 6));
-            result += static_cast<char>(0x80 | (code & 0x3F));
-          } else if (code < 0x10000) {
-            result += static_cast<char>(0xE0 | (code >> 12));
-            result += static_cast<char>(0x80 | ((code >> 6) & 0x3F));
-            result += static_cast<char>(0x80 | (code & 0x3F));
-          } else {
-            result += static_cast<char>(0xF0 | (code >> 18));
-            result += static_cast<char>(0x80 | ((code >> 12) & 0x3F));
-            result += static_cast<char>(0x80 | ((code >> 6) & 0x3F));
-            result += static_cast<char>(0x80 | (code & 0x3F));
-          }
-          i = semi + 1;
-          continue;
-        } else {
-          // Unknown entity — keep as-is
-          result += text.substr(i, semi - i + 1);
-        }
-        i = semi + 1;
-        continue;
-      }
-    }
-    result += text[i];
-    ++i;
-  }
-  return result;
-}
 
 static bool is_block_element(XmlStringView sv) {
   if (!sv.data)
