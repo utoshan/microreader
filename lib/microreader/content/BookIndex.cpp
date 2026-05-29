@@ -1,5 +1,6 @@
 #include "BookIndex.h"
 
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <queue>
@@ -114,7 +115,7 @@ void BookIndex::build_index(const std::string& root_dir, DrawBuffer& buf) {
 
     struct dirent* ent;
     while ((ent = readdir(dir)) != nullptr) {
-      if (std::strcmp(ent->d_name, ".") == 0 || std::strcmp(ent->d_name, "..") == 0)
+      if (ent->d_name[0] == '.')
         continue;
 
       std::string fullpath = current_dir + "/" + ent->d_name;
@@ -123,8 +124,14 @@ void BookIndex::build_index(const std::string& root_dir, DrawBuffer& buf) {
         q.push(fullpath);
       } else {
         size_t len = std::strlen(ent->d_name);
-        if (len > 5 && std::strcmp(ent->d_name + len - 5, ".epub") == 0) {
-          epub_files.push_back(fullpath);
+        if (len > 5) {
+          const char* ext = ent->d_name + len - 5;
+          char ext_lower[6];
+          for (int i = 0; i < 5; i++)
+            ext_lower[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(ext[i])));
+          ext_lower[5] = '\0';
+          if (std::strcmp(ext_lower, ".epub") == 0)
+            epub_files.push_back(fullpath);
         }
       }
     }
@@ -136,8 +143,9 @@ void BookIndex::build_index(const std::string& root_dir, DrawBuffer& buf) {
       if (!entry.is_regular_file())
         continue;
       auto ext = entry.path().extension().string();
-      // Handle uppercase as well if needed, but standard is .epub
-      if (ext == ".epub" || ext == ".EPUB") {
+      for (char& c : ext)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      if (ext == ".epub") {
         std::string path_str = entry.path().string();
         // normalize slashes for index stability across platforms
         for (char& c : path_str) {
