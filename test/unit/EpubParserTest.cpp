@@ -426,6 +426,133 @@ TEST(XhtmlBody, HrInlineStyleOverridesExternalCss) {
   EXPECT_EQ(*paragraphs[0].hr_width_pct, 33u);
 }
 
+// ---------------------------------------------------------------------------
+// Drop-cap tests
+// ---------------------------------------------------------------------------
+
+TEST(XhtmlBody, DropCapAscii) {
+  // <span style="float:left"> containing exactly one ASCII character.
+  // That character should appear as the first run with size_pct=150.
+  const char* xhtml =
+      "<html><body>"
+      "<p><span style=\"float: left; font-size: 150%;\">O</span>nce upon a time.</p>"
+      "</body></html>";
+
+  ZipReader dummy_zip;
+  std::vector<Paragraph> paragraphs;
+  parse_xhtml_body(reinterpret_cast<const uint8_t*>(xhtml), std::strlen(xhtml), nullptr, nullptr, "", dummy_zip,
+                   paragraphs);
+
+  ASSERT_EQ(paragraphs.size(), 1u);
+  EXPECT_EQ(paragraphs[0].type, ParagraphType::Text);
+  const auto& runs = paragraphs[0].text.runs;
+  ASSERT_GE(runs.size(), 2u);
+  // First run: the drop cap letter
+  EXPECT_EQ(runs[0].text, "O");
+  EXPECT_EQ(runs[0].size_pct, 150u);
+  // Second run: the rest of the paragraph text
+  EXPECT_FALSE(runs[1].text.empty());
+  EXPECT_EQ(runs[1].text.substr(0, 3), "nce");
+}
+
+TEST(XhtmlBody, DropCapUtf8) {
+  // <span style="float:left"> containing exactly one multi-byte UTF-8 codepoint (É = 0xC3 0x89).
+  // The two-byte sequence must be captured whole as the drop cap character.
+  const char* xhtml =
+      "<html><body>"
+      "<p><span style=\"float: left; font-size: 150%;\">\xC3\x89</span>trange.</p>"
+      "</body></html>";
+
+  ZipReader dummy_zip;
+  std::vector<Paragraph> paragraphs;
+  parse_xhtml_body(reinterpret_cast<const uint8_t*>(xhtml), std::strlen(xhtml), nullptr, nullptr, "", dummy_zip,
+                   paragraphs);
+
+  ASSERT_EQ(paragraphs.size(), 1u);
+  EXPECT_EQ(paragraphs[0].type, ParagraphType::Text);
+  const auto& runs = paragraphs[0].text.runs;
+  ASSERT_GE(runs.size(), 2u);
+  EXPECT_EQ(runs[0].text, "\xC3\x89");
+  EXPECT_EQ(runs[0].size_pct, 150u);
+  EXPECT_EQ(runs[1].text.substr(0, 6), "trange");
+}
+
+TEST(XhtmlBody, DropCapMultiCharFallback) {
+  // <span style="float:left"> with two characters must NOT be treated as a
+  // drop cap — both chars should appear as normal inline text.
+  const char* xhtml =
+      "<html><body>"
+      "<p><span style=\"float: left;\">No</span> fallback text.</p>"
+      "</body></html>";
+
+  ZipReader dummy_zip;
+  std::vector<Paragraph> paragraphs;
+  parse_xhtml_body(reinterpret_cast<const uint8_t*>(xhtml), std::strlen(xhtml), nullptr, nullptr, "", dummy_zip,
+                   paragraphs);
+
+  ASSERT_EQ(paragraphs.size(), 1u);
+  EXPECT_EQ(paragraphs[0].type, ParagraphType::Text);
+  // "No" must be present as normal text (not dropped)
+  std::string full;
+  for (auto& r : paragraphs[0].text.runs)
+    full += r.text;
+  EXPECT_NE(full.find("No"), std::string::npos);
+  // No run should have a size_pct above 100 from this span
+  for (auto& r : paragraphs[0].text.runs) {
+    if (r.text == "No" || r.text == "No ") {
+      EXPECT_EQ(r.size_pct, 100u) << "Multi-char span must not get drop-cap sizing";
+    }
+  }
+}
+
+TEST(XhtmlBody, DropCapSizeCap) {
+  // font-size: 200% should be capped to 150% by the drop-cap path.
+  const char* xhtml =
+      "<html><body>"
+      "<p><span style=\"float: left; font-size: 200%;\">T</span>he rest.</p>"
+      "</body></html>";
+
+  ZipReader dummy_zip;
+  std::vector<Paragraph> paragraphs;
+  parse_xhtml_body(reinterpret_cast<const uint8_t*>(xhtml), std::strlen(xhtml), nullptr, nullptr, "", dummy_zip,
+                   paragraphs);
+
+  ASSERT_EQ(paragraphs.size(), 1u);
+  const auto& runs = paragraphs[0].text.runs;
+  ASSERT_GE(runs.size(), 1u);
+  EXPECT_EQ(runs[0].text, "T");
+  EXPECT_EQ(runs[0].size_pct, 150u) << "Drop cap size must be capped at 150%";
+}
+
+TEST(XhtmlBody, DropCapBlockFloatIsNotDropCap) {
+  // A block-level element with float:left must use the old image-float
+  // pipeline, not the drop-cap path.
+  const char* xhtml =
+      "<html><body>"
+      "<div style=\"float: left;\"><p>Block content</p></div>"
+      "<p>Normal paragraph after block float.</p>"
+      "</body></html>";
+
+  ZipReader dummy_zip;
+  std::vector<Paragraph> paragraphs;
+  parse_xhtml_body(reinterpret_cast<const uint8_t*>(xhtml), std::strlen(xhtml), nullptr, nullptr, "", dummy_zip,
+                   paragraphs);
+
+  // Should produce at least one paragraph with normal (100%) size_pct runs
+  bool found_normal = false;
+  for (auto& p : paragraphs) {
+    if (p.type != ParagraphType::Text)
+      continue;
+    for (auto& r : p.text.runs) {
+      if (!r.text.empty()) {
+        EXPECT_EQ(r.size_pct, 100u) << "Block float must not produce drop-cap sized runs";
+        found_normal = true;
+      }
+    }
+  }
+  EXPECT_TRUE(found_normal);
+}
+
 TEST(XhtmlBody, HtmlEntities) {
   const char* xhtml = "<html><body><p>Tom &amp; Jerry &lt;3&gt; &quot;test&quot;</p></body></html>";
 

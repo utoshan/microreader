@@ -1263,6 +1263,35 @@ def ch_mixed_sizes_baseline():
     )
 
 
+def ch_drop_cap():
+    """Chapter 43: Text-based drop caps via <span style='float:left'>."""
+    return make_xhtml(
+        "Drop Caps",
+        """\
+<h1>43. Drop Caps</h1>
+
+<h2>Basic ASCII drop cap (default 150% size)</h2>
+<p><span style="float: left; font-size: 150%;">O</span>nce upon a time in a land far away, a story began with an oversized first letter rendered as a drop cap. The rest of this paragraph should flow normally after the drop cap character.</p>
+
+<h2>UTF-8 drop cap (multi-byte codepoint)</h2>
+<p><span style="float: left; font-size: 150%;">É</span>trange comme la vie peut parfois réserver des surprises. The É above is a two-byte UTF-8 sequence and should be captured correctly as the drop cap character.</p>
+
+<h2>Custom font size (200% capped to 150%)</h2>
+<p><span style="float: left; font-size: 200%;">T</span>he font-size requested is 200% but the renderer caps drop cap size at 150%. This paragraph tests the size cap behaviour.</p>
+
+<h2>No drop cap — multi-char span (fallback to normal text)</h2>
+<p><span style="float: left;">No</span> This span contains two characters so it should NOT be treated as a drop cap; the text "No" must appear as normal inline text.</p>
+
+<h2>No drop cap — block float (image float, not drop cap)</h2>
+<div style="float: left;">
+  <p>Block float content</p>
+</div>
+<p>A block-level float is the old image-float pipeline, not a drop cap. This paragraph should follow the block float normally.</p>
+""",
+        css_link="style.css",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Image generation
 # ---------------------------------------------------------------------------
@@ -1417,6 +1446,7 @@ def main():
             "42. Centered With Margins",
             ch_centered_with_margins(),
         ),
+        ("ch43", "ch43_drop_cap.xhtml", "43. Drop Caps", ch_drop_cap()),
     ]
 
     # Build manifest and spine
